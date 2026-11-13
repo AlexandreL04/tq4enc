@@ -1,0 +1,186 @@
+﻿From edba3b66dda1faf283d981c3906117f4942997f2 Mon Sep 17 00:00:00 2001
+From: Alex <75579937+AlexandreL04@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:26:36 +0100
+Subject: [PATCH] qwen35: calibration statistics for quantizers
+ (TQLLM_CALIB_OUT)
+
+With TQLLM_CALIB_OUT=FILE the engine accumulates, for each matmul input
+of the trunk, the sum over prefilled tokens of x x^T restricted to every
+128-wide block, in the rotated basis the TQ weights are stored in, and
+rewrites FILE after every prefilled prompt. A quantizer can use it as
+the per-block Hessian of its rounding error. Prefill chunks only, one
+slot; without the variable nothing is allocated or computed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EcABmjDqBccKS6zFKBPTCA
+---
+ src/models/qwen/qwen35/qwen35_engine.hpp  | 16 ++++++
+ src/models/qwen/qwen35/qwen35_forward.cpp | 61 +++++++++++++++++++++++
+ src/models/qwen/qwen35/qwen35_spec.cpp    |  3 ++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/src/models/qwen/qwen35/qwen35_engine.hpp b/src/models/qwen/qwen35/qwen35_engine.hpp
+index af6dd13..49a782a 100644
+--- a/src/models/qwen/qwen35/qwen35_engine.hpp
++++ b/src/models/qwen/qwen35/qwen35_engine.hpp
+@@ -136,6 +136,10 @@ public:
+             smooth_prebuild();
+             memlog("calibrate");
+             pc_on = opt.prompt_cache || (kv_cmp && slots == 1);  // several slots: each keeps its own conversation
++            if (const char * e = std::getenv("TQLLM_CALIB_OUT"); e && *e) {
++                cal_path = e;
++                std::fprintf(stderr, "tqllm: calibration: per-block input statistics of prefilled tokens -> %s\n", e);
++            }
+             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
+             parked.resize(size_t(slots));
+             for (int s = 1; s < slots; ++s) {  // allocate slot s in the members, then park it; slot 0 stays active
+@@ -272,6 +276,18 @@ private:
+     static constexpr uint32_t kTail = 64;
+     bool pc_on = false, pc_live = false;
+     uint32_t pc_snap = 0;
++    // Calibration (TQLLM_CALIB_OUT=FILE): for each matmul input of the trunk, the sum over prefilled tokens of x x^T
++    // restricted to every 128-wide block, in the rotated basis the TQ weights are stored in. A quantizer uses it as the
++    // exact per-block Hessian of its rounding error. Prefill chunks only (n > NVER, one slot); off: no cost.
++    // kinds: 0 layer input (attn q/k/v, GDN qkv/gate and b/a)  1 attn_output / ssm_out input  2 FFN gate/up input
++    //        3 FFN down input
++    static constexpr int kCalKinds = 4, kCalBlock = 128;
++    std::string cal_path;
++    std::vector<Buf> cal_acc;       // [layer * kCalKinds + kind]: dim / 128 blocks of 128 x 128 FP32 sums
++    std::vector<uint32_t> cal_dim;
++    std::vector<uint64_t> cal_tok;  // tokens accumulated per key
++    void cal(const Layer & L, int kind, int d, int n);
++    void cal_write();
+     std::vector<uint32_t> pc_seq;
+     std::unique_ptr<HostBuf> pc_host;
+     uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
+diff --git a/src/models/qwen/qwen35/qwen35_forward.cpp b/src/models/qwen/qwen35/qwen35_forward.cpp
+index f21e4a7..adefb00 100644
+--- a/src/models/qwen/qwen35/qwen35_forward.cpp
++++ b/src/models/qwen/qwen35/qwen35_forward.cpp
+@@ -217,6 +217,63 @@ void Qwen35Engine::cmp_upload() {
+     ck(cudaMemcpyAsync(d_stage_off.p, off, sizeof(off), cudaMemcpyHostToDevice, stream));
+ }
+ 
++void Qwen35Engine::cal(const Layer & L, int kind, int d, int n) {
++    if (cal_path.empty() || n <= NVER || !segs.empty() || d % kCalBlock) return;
++    const std::ptrdiff_t l = &L - layer.data();
++    if (l < 0 || l >= std::ptrdiff_t(cfg.layers)) return;  // not a trunk layer (the MTP block)
++    if (cal_acc.empty()) {
++        cal_acc.resize(size_t(cfg.layers) * kCalKinds);
++        cal_dim.assign(cal_acc.size(), 0);
++        cal_tok.assign(cal_acc.size(), 0);
++    }
++    const size_t key = size_t(l) * kCalKinds + size_t(kind);
++    const size_t bytes = size_t(d) * kCalBlock * sizeof(float);
++    if (!cal_acc[key].p) {
++        cal_acc[key] = Buf(bytes);
++        ck(cudaMemsetAsync(cal_acc[key].p, 0, bytes, stream));
++        cal_dim[key] = uint32_t(d);
++    }
++    if (cal_dim[key] != uint32_t(d)) throw std::runtime_error("calibration: an input changed width");
++    // v_xh is [n][d]: seen column-major it is a d x n matrix, and block b is the 128 x n slice starting at row 128 b.
++    // One batched GEMM adds X_b X_b^T (FP32 accumulate: FP16 squares would overflow) to every block's sum.
++    const float one = 1.f;
++    const auto * x = v_xh.as<__half>();
++    cb(cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_T, kCalBlock, kCalBlock, n, &one, x, CUDA_R_16F, d, kCalBlock,
++                                  x, CUDA_R_16F, d, kCalBlock, &one, cal_acc[key].p, CUDA_R_32F, kCalBlock,
++                                  kCalBlock * kCalBlock, d / kCalBlock, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
++    cal_tok[key] += uint64_t(n);
++}
++
++// File: "TQCALIB1", u32 layers, u32 kinds, u32 block, u32 reserved; then per key u32 layer, u32 kind, u32 dim,
++// u32 reserved, u64 tokens, and dim / block matrices of block x block float32 (column-major, symmetric). Rewritten
++// whole after every prefilled prompt, so the last file holds everything accumulated so far.
++void Qwen35Engine::cal_write() {
++    if (cal_path.empty() || cal_acc.empty()) return;
++    sync_ck();
++    const std::string tmp = cal_path + ".tmp";
++    FILE * f = std::fopen(tmp.c_str(), "wb");
++    if (!f) throw std::runtime_error("calibration: cannot write " + tmp);
++    const uint32_t head[4] = {uint32_t(cfg.layers), uint32_t(kCalKinds), uint32_t(kCalBlock), 0};
++    bool ok = std::fwrite("TQCALIB1", 1, 8, f) == 8 && std::fwrite(head, sizeof head, 1, f) == 1;
++    std::vector<float> host;
++    uint64_t total = 0;
++    for (size_t key = 0; key < cal_acc.size() && ok; ++key) {
++        if (!cal_acc[key].p) continue;
++        const uint32_t d = cal_dim[key];
++        const uint32_t rec[4] = {uint32_t(key / kCalKinds), uint32_t(key % kCalKinds), d, 0};
++        host.resize(size_t(d) * kCalBlock);
++        ck(cudaMemcpy(host.data(), cal_acc[key].p, host.size() * sizeof(float), cudaMemcpyDeviceToHost));
++        ok = std::fwrite(rec, sizeof rec, 1, f) == 1 && std::fwrite(&cal_tok[key], sizeof(uint64_t), 1, f) == 1 &&
++             std::fwrite(host.data(), sizeof(float), host.size(), f) == host.size();
++        total = std::max(total, cal_tok[key]);
++    }
++    ok = std::fclose(f) == 0 && ok;
++    if (!ok) throw std::runtime_error("calibration: short write to " + tmp);
++    std::remove(cal_path.c_str());
++    if (std::rename(tmp.c_str(), cal_path.c_str()) != 0) throw std::runtime_error("calibration: cannot rename " + tmp);
++    std::fprintf(stderr, "tqllm: calibration: %llu tokens accumulated, file rewritten\n", (unsigned long long) total);
++}
++
+ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_host
+     const size_t cb = conv_bytes(), rb = rec_bytes(), nl = conv_state.size() / NSLOT;
+     if (!pc_host) pc_host = std::make_unique<HostBuf>(nl * (cb + rb));
+@@ -981,6 +1038,7 @@ void Qwen35Engine::attn_mixer(const Layer & L, bf16 * kc, bf16 * vc, int n, int
+     }
+     if (!fuse) rot_h(O, XH, nh * hd, n);
+     st("attn_core(norm,rope,kv,gate)");
++    cal(L, 1, nh * hd, n);
+     mm_h(L.wo, M, n);
+     st("attn_wo_matvec");
+ }
+@@ -1000,6 +1058,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
+     auto * XH = v_xh.as<__half>();
+     tqllm_cuda::add_sumsq(M, resid ? resid : R, v_pm.as<float>(), n * H, stream);
+     nrot_h(M, L.post_norm, v_pm.as<float>(), XH, H, n);
++    cal(L, 2, H, n);
+     const __half * XIN = XH;  // DIAG: TQLLM_DEBUG=rot_router forces the rotated copy for the router
+     if (tqllm::bf16_ba_unrotated(basis_) && v_xu.p && !tqllm::debug_on("rot_router")) {
+         tqllm_cuda::norm_h(M, L.post_norm, v_pm.as<float>(), cfg.eps, v_xu.as<__half>(), H, n, stream);
+@@ -1141,6 +1200,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
+     if (basis_ == Basis::Tq4Rot128 && prefill_gemm(L.w_gu, n) && L.w_gu.fmt->basis() == basis_) {
+         gemm_rows(L.w_gu, nullptr, n, L.w_gu.rows);  // FP16 gate / up straight into the fused SwiGLU + rotation
+         tqllm_cuda::tq4_swiglu_rot_from_h(gemm_c.as<__half>(), n, F, XH, stream);
++        cal(L, 3, F, n);
+         mm_h(L.w_down, X, n);
+         tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
+         return;
+@@ -1157,6 +1217,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
+         rot_h(ACT, XH, F, n);
+     }
+     st("ffn_swiglu_rot");
++    cal(L, 3, F, n);
+     mm_h(L.w_down, X, n);
+     st("ffn_down_matvec");
+     tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
+diff --git a/src/models/qwen/qwen35/qwen35_spec.cpp b/src/models/qwen/qwen35/qwen35_spec.cpp
+index 1358541..c7d19dc 100644
+--- a/src/models/qwen/qwen35/qwen35_spec.cpp
++++ b/src/models/qwen/qwen35/qwen35_spec.cpp
+@@ -51,6 +51,7 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
+         const auto & L = layer[l];
+         capture_feature(l, X, v_feat.as<bf16>(), n);
+         nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
++        cal(L, 0, H, n);
+         st("in_norm_rot(+feature)");
+         if (cfg.full[l]) {
+             if (kv_staged) ck(cudaStreamWaitEvent(stream, kv_ready[attn_i & 1], 0));
+@@ -121,6 +122,7 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
+                 rot_h(O, XH, zdim, n);
+             }
+             st("gdn_gated_rms+rot");
++            cal(L, 1, zdim, n);
+             mm_h(L.w_out, M, n);
+             st("gdn_out_matvec");
+             ++lin_i;
+@@ -332,6 +334,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
+         }
+         last_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+     }
++    cal_write();
+     gen = Gen{};
+     gen.out.assign(1, next);
+     if (opt.lookup) gen.hist.assign(prompt.begin(), prompt.end());
+-- 
+2.53.0.windows.1
+

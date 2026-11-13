@@ -1,0 +1,6 @@
+__pycache__/
+*.gguf
+*.bin
+*.dat
+*.data
+*.pyc
