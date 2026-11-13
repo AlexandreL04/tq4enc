@@ -121,7 +121,7 @@ refinement. The cost under `M` can therefore only decrease.
 - One architecture tested (Qwen3.8-27B, dense). MoE files and the `-QSA` files of tqLLM 1.6.0 (in-file attention
   indexer) are not produced.
 - A recipe file of the same architecture is required.
-- The engine patch was written and used on tqLLM 1.5.0; the file in `patches/` is the same change on 1.6.0.
+- The statistics behind the results above were collected with the engine patch on tqLLM 1.5.0. The file in `patches/` is the same change on 1.6.0, built and checked there (it writes the same 256 inputs). On Windows, 1.6.0 itself needs [tqllm#41](https://github.com/turbo-tan/tqllm/pull/41) to build.
 - KLD numbers are against `Q8_0`, not BF16: they are comparable with each other, not with numbers measured against
   BF16 elsewhere.
 - Error feedback acts inside a block of 128, not across a whole row.
